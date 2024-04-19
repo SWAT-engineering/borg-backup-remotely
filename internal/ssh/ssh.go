@@ -15,6 +15,27 @@ import (
 	"github.com/swat-engineering/borg-backup-remotely/internal/config"
 )
 
+func copyIgnoreError(dst io.Writer, src io.Reader) {
+	if _, err := io.Copy(dst, src); err != nil {
+		log.WithError(err).Debug("We intentionally ignore this error in copying")
+	}
+}
+
+func Proxy(a io.ReadWriter, b io.ReadWriter) {
+	done := make(chan bool, 2)
+	go func() {
+		copyIgnoreError(a, b)
+		done <- true
+	}()
+	go func() {
+		copyIgnoreError(b, a)
+		done <- true
+	}()
+
+	// now we wait until either side is done
+	<-done
+}
+
 func ForwardSingleConnection(localSSH net.Listener, con *ssh.Client, address string) {
 	local, err := localSSH.Accept()
 	if err != nil {
@@ -30,18 +51,7 @@ func ForwardSingleConnection(localSSH net.Listener, con *ssh.Client, address str
 	}
 	defer remote.Close()
 
-	done := make(chan bool, 2)
-	go func() {
-		io.Copy(local, remote)
-		done <- true
-	}()
-	go func() {
-		io.Copy(remote, local)
-		done <- true
-	}()
-
-	// now we wait until either side is done
-	<-done
+	Proxy(local, remote)
 	// end of this function will execute the deferred closes
 }
 
@@ -225,7 +235,7 @@ func pipeStreamsActual(outPipe io.Reader, errPipe io.Reader, outError error, err
 		return fmt.Errorf("opening err pipe: %w", errError)
 	}
 
-	go io.Copy(target, outPipe)
-	go io.Copy(target, errPipe)
+	go copyIgnoreError(target, outPipe)
+	go copyIgnoreError(target, errPipe)
 	return nil
 }

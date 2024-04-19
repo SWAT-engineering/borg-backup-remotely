@@ -61,14 +61,14 @@ func main() {
 		}
 		if d.Output != nil {
 			os.Stdout.WriteString("Output of " + d.Name + ":\n")
-			io.Copy(os.Stdout, d.Output)
+			if _, err := io.Copy(os.Stdout, d.Output); err != nil {
+				log.WithError(err).Error("Could not copy output of backup process to our stdout")
+			}
 		}
 	}
 	if anyError {
 		os.Exit(1)
 	}
-
-	log.Info("Backups are done, now starting pruning")
 }
 
 func getBackupRawKey(bc config.BorgConfig) *interface{} {
@@ -136,7 +136,9 @@ func (b *borg) exec(cmd string) error {
 		return fmt.Errorf("couldn't set remote BORG_RSH: %w", err)
 	}
 
-	b.keyring.RemoveAll()
+	if err = b.keyring.RemoveAll(); err != nil {
+		log.WithError(err).Error("Could not clear keyring before adding a new key")
+	}
 	// we load the key for backup very shortly in the KeyRing, so that there is a very short window to catch it.
 	err = b.keyring.Add(agent.AddedKey{
 		PrivateKey:   *getBackupRawKey(b.mainConfig),
@@ -152,12 +154,16 @@ func (b *borg) exec(cmd string) error {
 		return fmt.Errorf("in pipe: %w", err)
 	}
 	defer inPipe.Close()
-	b.output.Write([]byte("remote> " + cmd + "\n"))
+	if _, err = b.output.Write([]byte("remote> " + cmd + "\n")); err != nil {
+		log.WithError(err).Error("Unexpected failure to write to output")
+	}
 	if err := ses.Start(cmd); err != nil {
 		return fmt.Errorf("starting command: %w", err)
 	}
 	time.Sleep(3 * time.Second) // give the password prompt time to show up
-	inPipe.Write([]byte(stdin))
+	if _, err = inPipe.Write([]byte(stdin)); err != nil {
+		log.WithError(err).Error("Could not write the passphrase to stdin")
+	}
 	return ses.Wait()
 
 }
@@ -182,18 +188,7 @@ func forwardSingleConnection(localSSH net.Listener, con *ssh.Client, address str
 	}
 	defer remote.Close()
 
-	done := make(chan bool, 2)
-	go func() {
-		io.Copy(local, remote)
-		done <- true
-	}()
-	go func() {
-		io.Copy(remote, local)
-		done <- true
-	}()
-
-	// now we wait until either side is done
-	<-done
+	specialSSH.Proxy(local, remote)
 	// end of this function will execute the deferred closes
 }
 
@@ -277,7 +272,9 @@ func (b *borg) execLocalForwarded(cmd string, key *interface{}) error {
 		return err
 	}
 
-	b.keyring.RemoveAll()
+	if err = b.keyring.RemoveAll(); err != nil {
+		return fmt.Errorf("Could not clear keyring: %w", err)
+	}
 	err = b.keyring.Add(agent.AddedKey{
 		PrivateKey:   *key,
 		LifetimeSecs: 2,
@@ -288,7 +285,9 @@ func (b *borg) execLocalForwarded(cmd string, key *interface{}) error {
 
 	log.WithField("borgCommand", borgCommand).WithField("env", borgCommand.Env).Info("setup completed, starting borg on local machine")
 
-	b.output.Write([]byte("local> " + cmd + "\n"))
+	if _, err := b.output.Write([]byte("local> " + cmd + "\n")); err != nil {
+		log.WithError(err).Error("Could not write to output buffer")
+	}
 	return borgCommand.Run()
 }
 
