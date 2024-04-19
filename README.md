@@ -24,6 +24,17 @@ This way:
 
 ## Setup
 
+### Install
+
+- Either build from source (`backup` will be installed in `$GOPATH/bin`):
+
+```
+go install github.com/swat-engineering/borg-backup-remotely/cmd/backup@v0.1.0
+```
+
+- [or download pre-build binary](https://github.com/SWAT-engineering/borg-backup-remotely/releases/tag/v0.0.1-test1)
+- or use pre-build docker image: `ghcr.io/SWAT-engineering/borg-backup-remotely:v0.1.0`
+
 ### Config
 
 This tool takes an .toml file piped into the stdin. As this file contains the SSH private keys, you should not store this plain text.

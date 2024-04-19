@@ -22,3 +22,6 @@ go.work
 
 *.toml
 secret-key
+dist/
+
+go-releaser.sh
