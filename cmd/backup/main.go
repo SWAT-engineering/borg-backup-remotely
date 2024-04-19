@@ -1,0 +1,390 @@
+package main
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"os/exec"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/pelletier/go-toml/v2"
+	log "github.com/sirupsen/logrus"
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
+
+	"github.com/swat-engineering/borg-backup-remotely/internal/config"
+	specialSSH "github.com/swat-engineering/borg-backup-remotely/internal/ssh"
+)
+
+func readConfig() *config.BorgBackups {
+	log.Info("Reading config from stdin")
+	var cfg config.BorgBackups
+	if err := toml.NewDecoder(os.Stdin).DisallowUnknownFields().Decode(&cfg); err != nil {
+		var details *toml.DecodeError
+		if errors.As(err, &details) {
+			fmt.Println(details.String())
+		}
+		var strictError *toml.StrictMissingError
+		if errors.As(err, &strictError) {
+			fmt.Println(strictError.String())
+		}
+		log.WithError(err).Fatal("Error parsing config file")
+	}
+	return &cfg
+}
+
+func main() {
+	cfg := readConfig()
+	log.WithField("Servers", len(cfg.Servers)).Info("Loaded configuration")
+	finished := make(chan done)
+
+	log.Info("Scheduling backups on the servers in parallel")
+	for _, server := range cfg.Servers {
+		go backupServer(cfg.Borg, server, finished)
+	}
+
+	anyError := false
+	completed := 0
+	for completed < len(cfg.Servers) {
+		d := <-finished
+		completed += 1
+		if d.Err != nil {
+			anyError = true
+			log.WithField("name", d.Name).WithError(d.Err).Error("failed backup")
+		} else {
+			log.WithField("name", d.Name).Info("backup finished running")
+		}
+		if d.Output != nil {
+			os.Stdout.WriteString("Output of " + d.Name + ":\n")
+			io.Copy(os.Stdout, d.Output)
+		}
+	}
+	if anyError {
+		os.Exit(1)
+	}
+
+	log.Info("Backups are done, now starting pruning")
+}
+
+func getBackupRawKey(bc config.BorgConfig) *interface{} {
+	return specialSSH.ParseSshRawKey(bc.BackupSshKey)
+}
+
+func getPruneRawKey(bc config.BorgConfig) *interface{} {
+	return specialSSH.ParseSshRawKey(bc.PruneSshKey)
+}
+
+type borg struct {
+	keyring    agent.Agent
+	con        *ssh.Client
+	output     io.Writer
+	mainConfig config.BorgConfig
+	boxTarget  config.BorgRepo
+}
+
+func setupBorgKnownHost(cfg config.BorgConfig, con *ssh.Client, output io.Writer) error {
+	ses, err := specialSSH.NewSession(con, output)
+	if err != nil {
+		return fmt.Errorf("building new session: %w", err)
+	}
+	defer ses.Close()
+	if err := ses.Run("grep -qxF '" + cfg.Server.KnownHost + "' ~/.ssh/known_hosts || echo \"" + cfg.Server.KnownHost + "\" >> ~/.ssh/known_hosts"); err != nil {
+		return fmt.Errorf("setting known hosts: %w", err)
+	}
+	return nil
+}
+
+func buildBorg(box config.BorgRepo, cfg config.BorgConfig, con *ssh.Client, sshAgent agent.Agent, output io.Writer) (*borg, error) {
+	// let's make sure the known hosts is fixed for the borg server
+	if err := setupBorgKnownHost(cfg, con, output); err != nil {
+		return nil, err
+	}
+
+	return &borg{
+		con:        con,
+		keyring:    sshAgent,
+		output:     output,
+		mainConfig: cfg,
+		boxTarget:  box,
+	}, nil
+}
+
+func (b *borg) exec(cmd string) error {
+	ses, err := specialSSH.NewSession(b.con, b.output)
+	if err != nil {
+		return fmt.Errorf("building new session: %w", err)
+	}
+	defer ses.Close()
+
+	borgRepo := fmt.Sprintf("ssh://%s@%s/%s/%s",
+		b.mainConfig.Server.Username,
+		b.mainConfig.Server.Host,
+		b.mainConfig.RootDir,
+		b.boxTarget.SubDir,
+	)
+	if err := ses.Setenv("BORG_REPO", borgRepo); err != nil {
+		return fmt.Errorf("couldn't set remote BORG_REPO: %w", err)
+	}
+	// we write the passphrase to the std, to avoid keeping it in environment
+	stdin := b.boxTarget.Passphrase + "\r\n"
+	if err := ses.Setenv("BORG_RSH", "ssh -C -oBatchMode=yes"); err != nil {
+		return fmt.Errorf("couldn't set remote BORG_RSH: %w", err)
+	}
+
+	b.keyring.RemoveAll()
+	// we load the key for backup very shortly in the KeyRing, so that there is a very short window to catch it.
+	err = b.keyring.Add(agent.AddedKey{
+		PrivateKey:   *getBackupRawKey(b.mainConfig),
+		LifetimeSecs: 2,
+	})
+	if err != nil {
+		return fmt.Errorf("cannot add key: %w", err)
+	}
+	log.WithField("cmd", cmd).Debug("running borg command")
+	//ses.Stdin = strings.NewReader(stdin)
+	inPipe, err := ses.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("in pipe: %w", err)
+	}
+	defer inPipe.Close()
+	b.output.Write([]byte("remote> " + cmd + "\n"))
+	if err := ses.Start(cmd); err != nil {
+		return fmt.Errorf("starting command: %w", err)
+	}
+	time.Sleep(3 * time.Second) // give the password prompt time to show up
+	inPipe.Write([]byte(stdin))
+	return ses.Wait()
+
+}
+
+// accept a single connection to this tcp socket, and forward it
+// to an address reachable on the remote ssh connection
+func forwardSingleConnection(localSSH net.Listener, con *ssh.Client, address string) {
+	local, err := localSSH.Accept()
+	if err != nil {
+		log.WithError(err).Error("local forwarded connection failed")
+		return
+	}
+	defer local.Close()
+
+	if !strings.Contains(address, ":") {
+		address += ":22"
+	}
+	remote, err := con.Dial("tcp", address)
+	if err != nil {
+		log.WithError(err).Error("local forwarded connection failed (forward connection)")
+		return
+	}
+	defer remote.Close()
+
+	done := make(chan bool, 2)
+	go func() {
+		io.Copy(local, remote)
+		done <- true
+	}()
+	go func() {
+		io.Copy(remote, local)
+		done <- true
+	}()
+
+	// now we wait until either side is done
+	<-done
+	// end of this function will execute the deferred closes
+}
+
+func (b *borg) buildHostKeyAliasName() string {
+	addrSplit := strings.Split(b.mainConfig.Server.Host, ":")
+	if len(addrSplit) == 1 || addrSplit[1] == "22" {
+		return addrSplit[0]
+	}
+	return "[" + addrSplit[0] + "]:" + addrSplit[1]
+
+}
+
+func buildSingleHostAgentSock(keyring agent.Agent) (string, error) {
+	sockAgent := fmt.Sprintf("/tmp/agent-%p.sock", &keyring)
+	if err := os.RemoveAll(sockAgent); err != nil {
+		return "", fmt.Errorf("cleaning old socket file: %w", err)
+	}
+	sockAgentListener, err := net.Listen("unix", sockAgent)
+	if err != nil {
+		return "", fmt.Errorf("creating socket file: %w", err)
+	}
+	go func() {
+		defer sockAgentListener.Close()
+		defer os.RemoveAll(sockAgent)
+
+		// only allow a single connection to the agent
+		con, err := sockAgentListener.Accept()
+		if err != nil {
+			log.WithError(err).Error("accepting new agent socket")
+			return
+		}
+		defer con.Close()
+		if err = agent.ServeAgent(keyring, con); err != nil && err != io.EOF {
+			log.WithError(err).Error("running agent on unix socket")
+		}
+	}()
+	return sockAgent, nil
+}
+
+// run a borg command locally so that the secrets
+// aren't shared to the server being back-upped
+func (b *borg) execLocalForwarded(cmd string, key *interface{}) error {
+	localSSH, err := net.Listen("tcp", "localhost:")
+	if err != nil {
+		return fmt.Errorf("opening local forward port: %w", err)
+	}
+	defer localSSH.Close()
+
+	// start a forwarding tunnel, only accept 1 connection and close
+	// we do this as the borg server doesn't have to be reachable from the instance
+	// that is running the backup script, but we know it to be reachable from the
+	// target server
+	go forwardSingleConnection(localSSH, b.con, b.mainConfig.Server.Host)
+
+	localPort := localSSH.Addr().(*net.TCPAddr).Port
+
+	splitCommand := strings.Split(cmd, " ")
+	borgCommand := exec.Command(splitCommand[0], splitCommand[1:]...)
+	borgCommand.Env = append(borgCommand.Env, fmt.Sprintf("BORG_REPO=ssh://%s@localhost:%d/%s/%s", b.mainConfig.Server.Username, localPort, b.mainConfig.RootDir, b.boxTarget.SubDir))
+	borgCommand.Env = append(borgCommand.Env, "BORG_RELOCATED_REPO_ACCESS_IS_OK=yes") // we are having a different port every time, thats fine
+	borgCommand.Env = append(borgCommand.Env, "BORG_PASSPHRASE="+b.boxTarget.Passphrase)
+
+	knownHostFile, err := specialSSH.CreateKnownHostFile(b.mainConfig.Server.KnownHost)
+	if err != nil {
+		return fmt.Errorf("creating temp file: %w", err)
+	}
+	defer os.Remove(knownHostFile)
+	// we tell it that even though it's connecting to localhost, check the host key we know
+	sshCommand := fmt.Sprintf("BORG_RSH=ssh -oBatchMode=yes -oHostKeyAlias=%s -oUserKnownHostsFile=%s", b.buildHostKeyAliasName(), knownHostFile)
+	borgCommand.Env = append(borgCommand.Env, sshCommand)
+
+	// we create a local ssh auth socket that can only be connected to once
+	// to reduce the window of other processes on the system hijacking the auth agent
+	sockAgent, err := buildSingleHostAgentSock(b.keyring)
+	if err != nil {
+		return err
+	}
+	borgCommand.Env = append(borgCommand.Env, "SSH_AUTH_SOCK="+sockAgent)
+
+	if err := specialSSH.PipeClosableStreams(borgCommand, b.output); err != nil {
+		return err
+	}
+
+	b.keyring.RemoveAll()
+	err = b.keyring.Add(agent.AddedKey{
+		PrivateKey:   *key,
+		LifetimeSecs: 2,
+	})
+	if err != nil {
+		return fmt.Errorf("loading key in keyring: %w", err)
+	}
+
+	log.WithField("borgCommand", borgCommand).WithField("env", borgCommand.Env).Info("setup completed, starting borg on local machine")
+
+	b.output.Write([]byte("local> " + cmd + "\n"))
+	return borgCommand.Run()
+}
+
+// I got this far!
+
+type done struct {
+	Name   string
+	Err    error
+	Output io.ReadWriter
+}
+
+type ThreadSafeBuffer struct {
+	b bytes.Buffer
+	m sync.Mutex
+}
+
+func (b *ThreadSafeBuffer) Read(p []byte) (n int, err error) {
+	b.m.Lock()
+	defer b.m.Unlock()
+	return b.b.Read(p)
+}
+func (b *ThreadSafeBuffer) Write(p []byte) (n int, err error) {
+	b.m.Lock()
+	defer b.m.Unlock()
+	return b.b.Write(p)
+}
+func (b *ThreadSafeBuffer) String() string {
+	b.m.Lock()
+	defer b.m.Unlock()
+	return b.b.String()
+}
+
+func backupServer(backupConfig config.BorgConfig, server config.Server, finished chan done) {
+	result := done{
+		Name:   server.Name,
+		Output: new(ThreadSafeBuffer),
+	}
+	keyRing := agent.NewKeyring()
+	mainCon, proxyCon, err := specialSSH.OpenSSHConnection(server.Connection, keyRing)
+	if err != nil {
+		result.Err = err
+		finished <- result
+		return
+	}
+
+	defer mainCon.Close()
+	if proxyCon != nil {
+		defer proxyCon.Close()
+	}
+
+	borg, err := buildBorg(server.BorgTarget, backupConfig, mainCon, keyRing, result.Output)
+	if err != nil {
+		result.Err = err
+		finished <- result
+		return
+	}
+
+	err = borg.exec("borg init --encryption=repokey-blake2")
+	if err != nil {
+		reInit := false
+		var initError *ssh.ExitError
+		if errors.As(err, &initError) {
+			reInit = initError.ExitStatus() == 2
+		}
+		if !reInit {
+			result.Err = fmt.Errorf("creating borg repo: %w", err)
+			finished <- result
+			return
+		} else {
+			log.Debug("The borg repo was already initialized, which is excepted for daily backups")
+		}
+	}
+
+	cmd := "borg create --lock-wait 600 --files-cache=ctime,size --noctime --noflags --noflags --stats"
+	for _, e := range server.Excludes {
+		cmd = cmd + " --exclude '" + e + "'"
+	}
+	cmd = cmd + " ::snapshot-{utcnow}"
+	for _, p := range server.SourcePaths {
+		cmd = cmd + " '" + p + "'"
+	}
+
+	err = borg.exec(cmd)
+
+	if err != nil {
+		result.Err = fmt.Errorf("creating borg archive failed: %w", err)
+		finished <- result
+		return
+	}
+
+	err = borg.execLocalForwarded("borg prune --lock-wait 600 --stats --keep-daily 7 --keep-weekly 20 --keep-monthly 12 --keep-yearly 15", getPruneRawKey(backupConfig))
+
+	if err != nil {
+		result.Err = fmt.Errorf("pruning borg archive failed: %w", err)
+		finished <- result
+		return
+	}
+	finished <- result
+}

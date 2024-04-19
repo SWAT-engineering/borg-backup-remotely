@@ -1,0 +1,2 @@
+age --encrypt -r age1la34wun8f576vgcvpjrxp4ta9cuxnezznn029dnncmu3u33mvvtsqxy54z -R ~/.ssh/id_ed25519.pub -o config.encrypted config.toml
+age --encrypt -r age1la34wun8f576vgcvpjrxp4ta9cuxnezznn029dnncmu3u33mvvtsqxy54z -R ~/.ssh/id_ed25519.pub -o config2.encrypted config2.toml
