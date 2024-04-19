@@ -60,7 +60,9 @@ func main() {
 			log.WithField("name", d.Name).Info("backup finished running")
 		}
 		if d.Output != nil {
-			os.Stdout.WriteString("Output of " + d.Name + ":\n")
+			if _, err := os.Stdout.WriteString("Output of " + d.Name + ":\n"); err != nil {
+				log.WithError(err).Error("Could not write output to Stdout")
+			}
 			if _, err := io.Copy(os.Stdout, d.Output); err != nil {
 				log.WithError(err).Error("Could not copy output of backup process to our stdout")
 			}
@@ -246,7 +248,7 @@ func (b *borg) execLocalForwarded(cmd string, key *interface{}) error {
 	localPort := localSSH.Addr().(*net.TCPAddr).Port
 
 	splitCommand := strings.Split(cmd, " ")
-	borgCommand := exec.Command(splitCommand[0], splitCommand[1:]...)
+	borgCommand := exec.Command(splitCommand[0], splitCommand[1:]...) // #nosec G204
 	borgCommand.Env = append(borgCommand.Env, fmt.Sprintf("BORG_REPO=ssh://%s@localhost:%d/%s/%s", b.mainConfig.Server.Username, localPort, b.mainConfig.RootDir, b.boxTarget.SubDir))
 	borgCommand.Env = append(borgCommand.Env, "BORG_RELOCATED_REPO_ACCESS_IS_OK=yes") // we are having a different port every time, thats fine
 	borgCommand.Env = append(borgCommand.Env, "BORG_PASSPHRASE="+b.boxTarget.Passphrase)
