@@ -6,15 +6,17 @@ on:
   pull_request:
     branches: [ "main" ]
 
-jobs:
+permissions:
+  contents: read
+  pull-requests: read
 
+
+jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
-
-    - name: Set up Go
-      uses: actions/setup-go@v4
+    - uses: actions/checkout@v4
+    - uses: actions/setup-go@v5
       with:
         go-version: '1.21'
 
@@ -23,3 +25,24 @@ jobs:
 
     - name: Test
       run: go test -v ./...
+
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+        cache: false
+    - name: Run Gosec Security Scanner
+      uses: securego/gosec@master
+      with:
+        args: ./..
+
+    - name: golangci-lint
+      uses: golangci/golangci-lint-action@v4
+      with:
+        version: latest
+        only-new-issues: true # on PR only show new issues
+        skip-cache: true # avoid influencing caching that also hurts the build job
