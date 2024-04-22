@@ -1,9 +1,8 @@
-package connections
+package ssh
 
 import (
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"strings"
 
@@ -13,47 +12,8 @@ import (
 	"golang.org/x/crypto/ssh/knownhosts"
 
 	"github.com/swat-engineering/borg-backup-remotely/internal/config"
+	"github.com/swat-engineering/borg-backup-remotely/internal/streams"
 )
-
-func copyIgnoreError(dst io.Writer, src io.Reader) {
-	if _, err := io.Copy(dst, src); err != nil {
-		log.WithError(err).Debug("We intentionally ignore this error in copying")
-	}
-}
-
-func Proxy(a io.ReadWriter, b io.ReadWriter) {
-	done := make(chan bool, 2)
-	go func() {
-		copyIgnoreError(a, b)
-		done <- true
-	}()
-	go func() {
-		copyIgnoreError(b, a)
-		done <- true
-	}()
-
-	// now we wait until either side is done
-	<-done
-}
-
-func ForwardSingleConnection(localSSH net.Listener, con *ssh.Client, address string) {
-	local, err := localSSH.Accept()
-	if err != nil {
-		log.WithError(err).Error("local forwarded connection failed")
-		return
-	}
-	defer local.Close()
-
-	remote, err := con.Dial("tcp", address)
-	if err != nil {
-		log.WithError(err).Error("local forwarded connection failed (forward connection)")
-		return
-	}
-	defer remote.Close()
-
-	Proxy(local, remote)
-	// end of this function will execute the deferred closes
-}
 
 func NewSession(client *ssh.Client, output io.Writer) (*ssh.Session, error) {
 	session, err := client.NewSession()
@@ -235,7 +195,7 @@ func pipeStreamsActual(outPipe io.Reader, errPipe io.Reader, outError error, err
 		return fmt.Errorf("opening err pipe: %w", errError)
 	}
 
-	go copyIgnoreError(target, outPipe)
-	go copyIgnoreError(target, errPipe)
+	go streams.CopyIgnoreError(target, outPipe)
+	go streams.CopyIgnoreError(target, errPipe)
 	return nil
 }

@@ -7,20 +7,19 @@ Before you ask, is it overkill? Maybe, but this is as close to zero secret as I 
 The process work as follows, given a borg backup server B, and a machine where this program is running C, and a server to be backed-up T.
 
 - C setups ssh connection to T with and SSH agent forwarded
-- C load append-only backup SSH key in SSH agent with a timeout of 3 seconds
-- C sends borg create (that target B) to T sending the backup passphrase to the stdin
-- T uses agent to create SSH connection, and then starts backup process
-- C now sets up a tcp forwarding to B via T
-- C creates a local SSH agent with the prune key loaded, but only allows for a single connection to it
-- C now runs the borg prune command locally against B, but uses T for tcp forwarding
+- C loads append-only backup SSH key in SSH agent with a timeout of 3 seconds
+- C sends borg create (and forwards a single connection to B ) to T and sends the backup passphrase to the stdin
+- T uses SSH agent to create SSH connection, and then starts backup process
+- C creates a local SSH agent with the prune key loaded, but only allows for a single connection to the agent
+- C now runs the borg prune command locally against B
 
 This way:
 
+- T does not need to have network access to B
 - T never has any ssh-key local that can connect to the B server
 - T never has the passphrase of the borg backup repo in the environment or a local file
-- If someone were to take over T, they could only get hold of the backup ssh-key, which only allows appends to the backup
-- You have to make sure C is secure, as it knows all the private keys
-- C doesn't have to have access to the B server, it only needs to connect to the servers that need to be backed-up
+- If someone were to take over T and watch the connections coming in, they could only get hold of the backup ssh-key, which only allows appends to the backup
+- You have to make sure C is secure, as it knows all the private keys and can connect to B
 
 ## Setup
 
@@ -101,16 +100,18 @@ Note that the ssh-keys for prune & backup should be different. The key for the u
 
 - borg SSH key constrained to a dir in append only mode. note that we'll create a borg backup repo per server as a subdir inside of this dir
 - separate borg prune ssh key that is allowed to manipulate borg repos (prune them)
-- make sure is reachable by the servers to be backed-up
+- make sure is reachable by the server that coordinates the backups
 
 
 ### per server to backup
-- make sure borg backup is installed
+
+- make sure borg backup & socat & openssh are installed
 - ssh key of the user that has read rights of the directories you want to backup.
-- allow tcp forwarding
+- set `StreamLocalBindUnlink yes` in `sshd_config`
 
 
-## server that runs this script
+## server that runs this command
 
-- install borg
+- install borg and openssh
 - make sure servers to backup are reachable
+- make sure backup server is reachable
