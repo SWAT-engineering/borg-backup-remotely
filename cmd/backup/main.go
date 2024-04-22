@@ -133,10 +133,6 @@ func (b *borg) pipeSingleConnection(target string) (string, error) {
 	return sshString, nil
 }
 
-func cleanup(socName string, con net.Listener) {
-	panic("unimplemented")
-}
-
 func (b *borg) calculateRepoUrl() string {
 	return fmt.Sprintf("ssh://%s@%s/%s/%s",
 		b.mainConfig.Server.Username,
