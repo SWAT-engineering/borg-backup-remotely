@@ -137,6 +137,7 @@ func (b *borg) pipeSingleConnection(target string) (string, error) {
 			log.WithError(err).WithField("target", target).Error("could not open target for proxying")
 			return
 		}
+		log.WithField("remote", remote).WithField("target", target).Info("Established")
 		defer remote.Close()
 		specialSSH.Proxy(newConnection, remote)
 	}()
@@ -166,7 +167,7 @@ func (b *borg) exec(cmd string) error {
 		return fmt.Errorf("could not start forwarding connection for server: %w", err)
 	}
 
-	if err := ses.Setenv("BORG_RSH", fmt.Sprintf("ssh -v %s -C -oBatchMode=yes", forwardedBorgRepo)); err != nil {
+	if err := ses.Setenv("BORG_RSH", fmt.Sprintf("ssh %s -oBatchMode=yes", forwardedBorgRepo)); err != nil {
 		return fmt.Errorf("couldn't set remote BORG_RSH: %w", err)
 	}
 
@@ -197,42 +198,9 @@ func (b *borg) exec(cmd string) error {
 	time.Sleep(3 * time.Second) // give the password prompt time to show up
 	// we write the passphrase to the std, to avoid keeping it in environment
 	if _, err = inPipe.Write([]byte(b.boxTarget.Passphrase + "\r\n")); err != nil {
-		log.WithError(err).Error("Could not write the passphrase to stdin")
+		log.WithError(err).Info("Could not write the passphrase to borg, which might be valid for init of repo")
 	}
 	return ses.Wait()
-
-}
-
-// accept a single connection to this tcp socket, and forward it
-// to an address reachable on the remote ssh connection
-func forwardSingleConnection(localSSH net.Listener, con *ssh.Client, address string) {
-	local, err := localSSH.Accept()
-	if err != nil {
-		log.WithError(err).Error("local forwarded connection failed")
-		return
-	}
-	defer local.Close()
-
-	if !strings.Contains(address, ":") {
-		address += ":22"
-	}
-	remote, err := con.Dial("tcp", address)
-	if err != nil {
-		log.WithError(err).Error("local forwarded connection failed (forward connection)")
-		return
-	}
-	defer remote.Close()
-
-	specialSSH.Proxy(local, remote)
-	// end of this function will execute the deferred closes
-}
-
-func (b *borg) buildHostKeyAliasName() string {
-	addrSplit := strings.Split(b.mainConfig.Server.Host, ":")
-	if len(addrSplit) == 1 || addrSplit[1] == "22" {
-		return addrSplit[0]
-	}
-	return "[" + addrSplit[0] + "]:" + addrSplit[1]
 
 }
 
@@ -265,25 +233,10 @@ func buildSingleHostAgentSock(keyring agent.Agent) (string, error) {
 
 // run a borg command locally so that the secrets
 // aren't shared to the server being back-upped
-func (b *borg) execLocalForwarded(cmd string, key *interface{}) error {
-	localSSH, err := net.Listen("tcp", "localhost:")
-	if err != nil {
-		return fmt.Errorf("opening local forward port: %w", err)
-	}
-	defer localSSH.Close()
-
-	// start a forwarding tunnel, only accept 1 connection and close
-	// we do this as the borg server doesn't have to be reachable from the instance
-	// that is running the backup script, but we know it to be reachable from the
-	// target server
-	go forwardSingleConnection(localSSH, b.con, b.mainConfig.Server.Host)
-
-	localPort := localSSH.Addr().(*net.TCPAddr).Port
-
+func (b *borg) execLocal(cmd string) error {
 	splitCommand := strings.Split(cmd, " ")
 	borgCommand := exec.Command(splitCommand[0], splitCommand[1:]...) // #nosec G204
-	borgCommand.Env = append(borgCommand.Env, fmt.Sprintf("BORG_REPO=ssh://%s@localhost:%d/%s/%s", b.mainConfig.Server.Username, localPort, b.mainConfig.RootDir, b.boxTarget.SubDir))
-	borgCommand.Env = append(borgCommand.Env, "BORG_RELOCATED_REPO_ACCESS_IS_OK=yes") // we are having a different port every time, thats fine
+	borgCommand.Env = append(borgCommand.Env, fmt.Sprintf("BORG_REPO=ssh://%s@%s/%s/%s", b.mainConfig.Server.Username, b.mainConfig.Server.Host, b.mainConfig.RootDir, b.boxTarget.SubDir))
 	borgCommand.Env = append(borgCommand.Env, "BORG_PASSPHRASE="+b.boxTarget.Passphrase)
 
 	knownHostFile, err := specialSSH.CreateKnownHostFile(b.mainConfig.Server.KnownHost)
@@ -291,9 +244,7 @@ func (b *borg) execLocalForwarded(cmd string, key *interface{}) error {
 		return fmt.Errorf("creating temp file: %w", err)
 	}
 	defer os.Remove(knownHostFile)
-	// we tell it that even though it's connecting to localhost, check the host key we know
-	sshCommand := fmt.Sprintf("BORG_RSH=ssh -oBatchMode=yes -oHostKeyAlias=%s -oUserKnownHostsFile=%s", b.buildHostKeyAliasName(), knownHostFile)
-	borgCommand.Env = append(borgCommand.Env, sshCommand)
+	borgCommand.Env = append(borgCommand.Env, "BORG_RSH=ssh -oBatchMode=yes -oUserKnownHostsFile="+knownHostFile)
 
 	// we create a local ssh auth socket that can only be connected to once
 	// to reduce the window of other processes on the system hijacking the auth agent
@@ -308,21 +259,19 @@ func (b *borg) execLocalForwarded(cmd string, key *interface{}) error {
 	}
 
 	if err = b.keyring.RemoveAll(); err != nil {
-		return fmt.Errorf("Could not clear keyring: %w", err)
+		return fmt.Errorf("could not clear keyring: %w", err)
 	}
-	err = b.keyring.Add(agent.AddedKey{
-		PrivateKey:   *key,
+	if err = b.keyring.Add(agent.AddedKey{
+		PrivateKey:   *getPruneRawKey(b.mainConfig),
 		LifetimeSecs: 2,
-	})
-	if err != nil {
-		return fmt.Errorf("loading key in keyring: %w", err)
+	}); err != nil {
+		return fmt.Errorf("failed loading key in keyring: %w", err)
 	}
-
-	log.WithField("borgCommand", borgCommand).WithField("env", borgCommand.Env).Info("setup completed, starting borg on local machine")
 
 	if _, err := b.output.Write([]byte("local> " + cmd + "\n")); err != nil {
 		log.WithError(err).Error("Could not write to output buffer")
 	}
+
 	return borgCommand.Run()
 }
 
@@ -413,7 +362,7 @@ func backupServer(backupConfig config.BorgConfig, server config.Server, finished
 		return
 	}
 
-	err = borg.execLocalForwarded("borg prune --lock-wait 600 --stats --keep-daily 7 --keep-weekly 20 --keep-monthly 12 --keep-yearly 15", getPruneRawKey(backupConfig))
+	err = borg.execLocal("borg prune --lock-wait 600 --stats --keep-daily 7 --keep-weekly 20 --keep-monthly 12 --keep-yearly 15")
 
 	if err != nil {
 		result.Err = fmt.Errorf("pruning borg archive failed: %w", err)
