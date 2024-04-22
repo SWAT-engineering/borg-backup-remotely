@@ -125,9 +125,18 @@ func (b *borg) pipeSingleConnection(target string) (string, error) {
 		return "", fmt.Errorf("could not open a unix socket listener, make sure 'StreamLocalBindUnlink yes' is set in sshd_config: %w", err)
 	}
 
+	if !strings.Contains(target, ":") {
+		target += ":22"
+	}
+
 	go func() {
 		defer con.Close()
-		streams.ForwardSingleConnection(con, target)
+		if err := streams.ForwardSingleConnection(con, target); err != nil {
+			log.WithError(err).
+				WithField("target", target).
+				WithField("socket", socName).
+				Error("Failed to forward target connection to the unix socket")
+		}
 	}()
 
 	return sshString, nil

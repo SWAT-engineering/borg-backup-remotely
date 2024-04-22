@@ -1,6 +1,7 @@
 package streams
 
 import (
+	"fmt"
 	"io"
 	"net"
 
@@ -13,36 +14,37 @@ func CopyIgnoreError(dst io.Writer, src io.Reader) {
 	}
 }
 
-func Proxy(a io.ReadWriter, b io.ReadWriter) {
-	done := make(chan bool, 2)
+// block until one side has reached EOF or an error
+// return the error of the first side that stopped
+func Proxy(a io.ReadWriter, b io.ReadWriter) error {
+	done := make(chan error, 2)
 	go func() {
-		CopyIgnoreError(a, b)
-		done <- true
+		_, err := io.Copy(a, b)
+		done <- err
 	}()
 	go func() {
-		CopyIgnoreError(b, a)
-		done <- true
+		_, err := io.Copy(b, a)
+		done <- err
 	}()
 
 	// now we wait until either side is done
-	<-done
+	// and return the result of the first side
+	return <-done
 }
 
-func ForwardSingleConnection(server net.Listener, target string) {
+func ForwardSingleConnection(server net.Listener, target string) error {
 	local, err := server.Accept()
 	if err != nil {
-		log.WithError(err).Error("local forwarded connection failed")
-		return
+		return fmt.Errorf("local forwarded connection setup failed: %w", err)
 	}
 	defer local.Close()
 
 	remote, err := net.Dial("tcp", target)
 	if err != nil {
-		log.WithError(err).Error("local forwarded connection failed (forward connection)")
-		return
+		return fmt.Errorf("local forwarded connection to the target failed: %w", err)
 	}
 	defer remote.Close()
 
-	Proxy(local, remote)
 	// end of this function will execute the deferred closes
+	return Proxy(local, remote)
 }
