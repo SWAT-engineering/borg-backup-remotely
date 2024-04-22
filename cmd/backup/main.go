@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
 	"os"
 	"os/exec"
@@ -20,6 +19,7 @@ import (
 
 	"github.com/swat-engineering/borg-backup-remotely/internal/config"
 	specialSSH "github.com/swat-engineering/borg-backup-remotely/internal/ssh"
+	"github.com/swat-engineering/borg-backup-remotely/internal/streams"
 )
 
 func readConfig() *config.BorgBackups {
@@ -118,31 +118,33 @@ func buildBorg(box config.BorgRepo, cfg config.BorgConfig, con *ssh.Client, sshA
 }
 
 func (b *borg) pipeSingleConnection(target string) (string, error) {
-	socName := fmt.Sprintf("/tmp/backup-connection-%d.sock", rand.Uint64())
+	socName := "/tmp/backup-connection.sock"
 	sshString := fmt.Sprintf("-o ProxyCommand='socat - UNIX-CLIENT:%s'", socName)
 	con, err := b.con.ListenUnix(socName)
 	if err != nil {
 		return "", fmt.Errorf("could not open a unix socket listener: %w", err)
 	}
+
 	go func() {
-		log.WithField("con", con).Info("waiting for connection to unix socket")
-		newConnection, err := con.Accept()
-		log.WithField("con", newConnection).Info("Got open for the unix socket")
-		if err != nil {
-			log.WithError(err).Error("Never got an open to this unix socket")
-		}
-		defer newConnection.Close()
-		remote, err := net.Dial("tcp", target)
-		if err != nil {
-			log.WithError(err).WithField("target", target).Error("could not open target for proxying")
-			return
-		}
-		log.WithField("remote", remote).WithField("target", target).Info("Established")
-		defer remote.Close()
-		specialSSH.Proxy(newConnection, remote)
+		defer con.Close()
+		streams.ForwardSingleConnection(con, target)
 	}()
 
 	return sshString, nil
+}
+
+func cleanup(socName string, con net.Listener) {
+	panic("unimplemented")
+}
+
+func (b *borg) calculateRepoUrl() string {
+	return fmt.Sprintf("ssh://%s@%s/%s/%s",
+		b.mainConfig.Server.Username,
+		b.mainConfig.Server.Host,
+		b.mainConfig.RootDir,
+		b.boxTarget.SubDir,
+	)
+
 }
 
 func (b *borg) exec(cmd string) error {
@@ -152,13 +154,7 @@ func (b *borg) exec(cmd string) error {
 	}
 	defer ses.Close()
 
-	borgRepo := fmt.Sprintf("ssh://%s@%s/%s/%s",
-		b.mainConfig.Server.Username,
-		b.mainConfig.Server.Host,
-		b.mainConfig.RootDir,
-		b.boxTarget.SubDir,
-	)
-	if err := ses.Setenv("BORG_REPO", borgRepo); err != nil {
+	if err := ses.Setenv("BORG_REPO", b.calculateRepoUrl()); err != nil {
 		return fmt.Errorf("couldn't set remote BORG_REPO: %w", err)
 	}
 
@@ -236,7 +232,7 @@ func buildSingleHostAgentSock(keyring agent.Agent) (string, error) {
 func (b *borg) execLocal(cmd string) error {
 	splitCommand := strings.Split(cmd, " ")
 	borgCommand := exec.Command(splitCommand[0], splitCommand[1:]...) // #nosec G204
-	borgCommand.Env = append(borgCommand.Env, fmt.Sprintf("BORG_REPO=ssh://%s@%s/%s/%s", b.mainConfig.Server.Username, b.mainConfig.Server.Host, b.mainConfig.RootDir, b.boxTarget.SubDir))
+	borgCommand.Env = append(borgCommand.Env, "BORG_REPO="+b.calculateRepoUrl())
 	borgCommand.Env = append(borgCommand.Env, "BORG_PASSPHRASE="+b.boxTarget.Passphrase)
 
 	knownHostFile, err := specialSSH.CreateKnownHostFile(b.mainConfig.Server.KnownHost)
