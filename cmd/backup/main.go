@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"os"
 	"os/exec"
@@ -116,6 +117,33 @@ func buildBorg(box config.BorgRepo, cfg config.BorgConfig, con *ssh.Client, sshA
 	}, nil
 }
 
+func (b *borg) pipeSingleConnection(target string) (string, error) {
+	socName := fmt.Sprintf("/tmp/backup-connection-%d.sock", rand.Uint64())
+	sshString := fmt.Sprintf("-o ProxyCommand='socat - UNIX-CLIENT:%s'", socName)
+	con, err := b.con.ListenUnix(socName)
+	if err != nil {
+		return "", fmt.Errorf("could not open a unix socket listener: %w", err)
+	}
+	go func() {
+		log.WithField("con", con).Info("waiting for connection to unix socket")
+		newConnection, err := con.Accept()
+		log.WithField("con", newConnection).Info("Got open for the unix socket")
+		if err != nil {
+			log.WithError(err).Error("Never got an open to this unix socket")
+		}
+		defer newConnection.Close()
+		remote, err := net.Dial("tcp", target)
+		if err != nil {
+			log.WithError(err).WithField("target", target).Error("could not open target for proxying")
+			return
+		}
+		defer remote.Close()
+		specialSSH.Proxy(newConnection, remote)
+	}()
+
+	return sshString, nil
+}
+
 func (b *borg) exec(cmd string) error {
 	ses, err := specialSSH.NewSession(b.con, b.output)
 	if err != nil {
@@ -132,9 +160,13 @@ func (b *borg) exec(cmd string) error {
 	if err := ses.Setenv("BORG_REPO", borgRepo); err != nil {
 		return fmt.Errorf("couldn't set remote BORG_REPO: %w", err)
 	}
-	// we write the passphrase to the std, to avoid keeping it in environment
-	stdin := b.boxTarget.Passphrase + "\r\n"
-	if err := ses.Setenv("BORG_RSH", "ssh -C -oBatchMode=yes"); err != nil {
+
+	forwardedBorgRepo, err := b.pipeSingleConnection(b.mainConfig.Server.Host)
+	if err != nil {
+		return fmt.Errorf("could not start forwarding connection for server: %w", err)
+	}
+
+	if err := ses.Setenv("BORG_RSH", fmt.Sprintf("ssh -v %s -C -oBatchMode=yes", forwardedBorgRepo)); err != nil {
 		return fmt.Errorf("couldn't set remote BORG_RSH: %w", err)
 	}
 
@@ -163,7 +195,8 @@ func (b *borg) exec(cmd string) error {
 		return fmt.Errorf("starting command: %w", err)
 	}
 	time.Sleep(3 * time.Second) // give the password prompt time to show up
-	if _, err = inPipe.Write([]byte(stdin)); err != nil {
+	// we write the passphrase to the std, to avoid keeping it in environment
+	if _, err = inPipe.Write([]byte(b.boxTarget.Passphrase + "\r\n")); err != nil {
 		log.WithError(err).Error("Could not write the passphrase to stdin")
 	}
 	return ses.Wait()
