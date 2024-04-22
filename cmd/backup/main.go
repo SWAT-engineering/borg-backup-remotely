@@ -122,7 +122,7 @@ func (b *borg) pipeSingleConnection(target string) (string, error) {
 	sshString := fmt.Sprintf("-o ProxyCommand='socat - UNIX-CLIENT:%s'", socName)
 	con, err := b.con.ListenUnix(socName)
 	if err != nil {
-		return "", fmt.Errorf("could not open a unix socket listener: %w", err)
+		return "", fmt.Errorf("could not open a unix socket listener, make sure 'StreamLocalBindUnlink yes' is set in sshd_config: %w", err)
 	}
 
 	go func() {
