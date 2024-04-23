@@ -330,12 +330,12 @@ func backupServer(backupConfig config.BorgConfig, server config.Server, finished
 		return
 	}
 
-	err = borg.exec("borg init --encryption=repokey-blake2")
+	err = borg.execLocal("borg init --encryption=repokey-blake2")
 	if err != nil {
 		reInit := false
-		var initError *ssh.ExitError
+		var initError *exec.ExitError
 		if errors.As(err, &initError) {
-			reInit = initError.ExitStatus() == 2
+			reInit = initError.ExitCode() == 2
 		}
 		if !reInit {
 			result.Err = fmt.Errorf("creating borg repo: %w", err)
@@ -363,7 +363,15 @@ func backupServer(backupConfig config.BorgConfig, server config.Server, finished
 		return
 	}
 
-	err = borg.execLocal("borg prune --lock-wait 600 --stats --keep-daily 7 --keep-weekly 20 --keep-monthly 12 --keep-yearly 15")
+	err = borg.execLocal("borg check --verbose")
+
+	if err != nil {
+		result.Err = fmt.Errorf("checking borg archive failed: %w", err)
+		finished <- result
+		return
+	}
+
+	err = borg.execLocal(fmt.Sprintf("borg prune --lock-wait 600 --stats %s", backupConfig.PruneSetting))
 
 	if err != nil {
 		result.Err = fmt.Errorf("pruning borg archive failed: %w", err)
