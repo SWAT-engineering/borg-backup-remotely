@@ -11,12 +11,12 @@ import (
 
 	log "github.com/sirupsen/logrus"
 	"github.com/swat-engineering/borg-backup-remotely/internal/config"
-	specialSSH "github.com/swat-engineering/borg-backup-remotely/internal/ssh"
+	sshCon "github.com/swat-engineering/borg-backup-remotely/internal/ssh"
 )
 
 type Borg struct {
-	backup  *specialSSH.SshConnection
-	target  *specialSSH.SshConnection
+	backup  *sshCon.SshConnection
+	target  *sshCon.SshConnection
 	cfg     config.Server
 	output  io.Writer
 	rootCfg config.BorgConfig
@@ -28,12 +28,12 @@ func (b *Borg) Close() {
 }
 
 func BuildBorg(cfg config.Server, root config.BorgConfig, output io.Writer) (*Borg, error) {
-	backupConnection, err := specialSSH.SetupConnection(root.Server)
+	backupConnection, err := sshCon.SetupConnection(root.Server)
 	if err != nil {
 		return nil, fmt.Errorf("could not connect to the backup server: %w", err)
 	}
 
-	targetConnection, err := specialSSH.SetupConnection(cfg.Connection)
+	targetConnection, err := sshCon.SetupConnection(cfg.Connection)
 	if err != nil {
 		return nil, fmt.Errorf("could not connect to the target server: %w", err)
 	}
@@ -63,6 +63,9 @@ func (b *Borg) ExecRemote(cmd string) error {
 		"BORG_RSH":                         fmt.Sprintf("sh -c 'socat - UNIX-CLIENT:%s'", SOC_NAME),
 		"BORG_PASSCOMMAND":                 "cat -", // take passphrase from stdin
 		"BORG_RELOCATED_REPO_ACCESS_IS_OK": "yes",
+	}
+	if _, err := b.output.Write([]byte("remote> " + cmd + "\n")); err != nil {
+		return fmt.Errorf("could write to output buffer: %w", err)
 	}
 
 	stdInPassphrase := bytes.NewReader([]byte(b.cfg.BorgTarget.Passphrase + "\r\n"))
@@ -109,7 +112,7 @@ func (b *Borg) ExecLocal(cmd string) error {
 	borgCommand.Stderr = b.output
 
 	if _, err := b.output.Write([]byte("local> " + cmd + "\n")); err != nil {
-		log.WithError(err).Error("Could not write to output buffer")
+		return fmt.Errorf("could write to output buffer: %w", err)
 	}
 
 	return borgCommand.Run()

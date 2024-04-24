@@ -57,7 +57,7 @@ func dialSsh(con config.Connection) (*ssh.Client, *ssh.Client, error) {
 		},
 		HostKeyCallback: khCallback,
 	}
-	log.WithField("config", config).Info("Connecting to server")
+	log.WithField("config", config).Debug("Connecting to server")
 
 	var client *ssh.Client
 	var proxyJumpClient *ssh.Client
@@ -70,10 +70,13 @@ func dialSsh(con config.Connection) (*ssh.Client, *ssh.Client, error) {
 		if !strings.Contains(targetJumpAddr, ":") {
 			targetJumpAddr += ":22"
 		}
+		log.WithField("jump", targetJumpAddr).Debug("Connecting to jump host first")
 		proxyJumpClient, err = ssh.Dial("tcp", targetJumpAddr, config)
 		if err != nil {
 			return nil, nil, fmt.Errorf("connecting to proxyJumpHost: %w", err)
 		}
+
+		log.WithField("target", targetAddr).Debug("Connecting to target via jump")
 		jumpedDial, err := proxyJumpClient.Dial("tcp", targetAddr)
 		if err != nil {
 			defer proxyJumpClient.Close()
@@ -88,6 +91,7 @@ func dialSsh(con config.Connection) (*ssh.Client, *ssh.Client, error) {
 		}
 		client = ssh.NewClient(c, chans, regs)
 	} else {
+		log.WithField("target", targetAddr).Debug("Connecting to target")
 		client, err = ssh.Dial("tcp", targetAddr, config)
 		if err != nil {
 			return nil, nil, fmt.Errorf("opening ssh connection:  %w", err)
@@ -120,6 +124,7 @@ func sendKeepAlive(client *ssh.Client, every time.Duration, maxErrors int) chan<
 					fails = 0
 				}
 			case <-done:
+				log.Debug("Gracefully stop sending keep-alives")
 				return
 			}
 		}

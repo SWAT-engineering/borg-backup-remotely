@@ -20,10 +20,12 @@ type SshConnection struct {
 }
 
 func SetupConnection(target config.Connection) (SshConnection, error) {
+	log.WithField("host", target.Host).Debug("Opening ssh client")
 	con, jumpCon, err := dialSsh(target)
 	if err != nil {
 		return SshConnection{}, err
 	}
+	log.WithField("host", target.Host).Debug("Opened ssh client")
 	result := SshConnection{nil, nil, nil, nil}
 	result.client = con
 	result.keepAlives = sendKeepAlive(con, 10*time.Second, 30)
@@ -43,7 +45,7 @@ func (c SshConnection) ExecuteSingleCommand(cmd string, stdIn io.Reader, stdOut 
 	if err != nil {
 		return fmt.Errorf("opening ssh session: %w", err)
 	}
-	log.WithField("session", session).Info("Opened session")
+	log.Debug("New session opened")
 	defer session.Close()
 
 	for k, v := range env {
@@ -55,6 +57,8 @@ func (c SshConnection) ExecuteSingleCommand(cmd string, stdIn io.Reader, stdOut 
 	session.Stdin = stdIn
 	session.Stdout = stdOut
 	session.Stderr = stdErr
+
+	log.WithField("cmd", cmd).Debug("Running command")
 
 	return session.Run(cmd)
 }

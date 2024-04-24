@@ -1,19 +1,18 @@
 package main
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
-	"sync"
 
 	"github.com/pelletier/go-toml/v2"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/swat-engineering/borg-backup-remotely/internal/borg"
 	"github.com/swat-engineering/borg-backup-remotely/internal/config"
+	"github.com/swat-engineering/borg-backup-remotely/internal/util"
 )
 
 func readConfig() *config.BorgBackups {
@@ -74,58 +73,39 @@ type done struct {
 	Output io.ReadWriter
 }
 
-type ThreadSafeBuffer struct {
-	b bytes.Buffer
-	m sync.Mutex
-}
-
-func (b *ThreadSafeBuffer) Read(p []byte) (n int, err error) {
-	b.m.Lock()
-	defer b.m.Unlock()
-	return b.b.Read(p)
-}
-func (b *ThreadSafeBuffer) Write(p []byte) (n int, err error) {
-	b.m.Lock()
-	defer b.m.Unlock()
-	return b.b.Write(p)
-}
-func (b *ThreadSafeBuffer) String() string {
-	b.m.Lock()
-	defer b.m.Unlock()
-	return b.b.String()
-}
-
 func backupServer(backupConfig config.BorgConfig, server config.Server, finished chan done) {
 	result := done{
 		Name:   server.Name,
-		Output: new(ThreadSafeBuffer),
+		Output: new(util.ThreadSafeBuffer),
 	}
-	reportError := func(err error) {
-		result.Err = err
-		finished <- result
-	}
+	result.Err = runBackupServer(backupConfig, server, result.Output)
+	finished <- result
 
-	borg, err := borg.BuildBorg(server, backupConfig, result.Output)
+}
+
+func runBackupServer(backupConfig config.BorgConfig, server config.Server, output io.ReadWriter) error {
+	borg, err := borg.BuildBorg(server, backupConfig, output)
 	if err != nil {
-		reportError(err)
-		return
+		return err
 	}
 	defer borg.Close()
 
+	myLog := log.WithField("name", server.Name)
+
+	myLog.Info("Connections established")
+
+	myLog.Info("Initializing borg repo if needed")
 	err = borg.ExecLocal("borg init --encryption=repokey-blake2")
 	if err != nil {
 		reInit := false
 		var initError *exec.ExitError
-		log.Infof("%T", err)
 		if errors.As(err, &initError) {
 			reInit = initError.ExitCode() == 2
 		}
 		if !reInit {
-			result.Err = fmt.Errorf("creating borg repo: %w", err)
-			finished <- result
-			return
+			return fmt.Errorf("creating borg repo: %w", err)
 		} else {
-			log.Debug("The borg repo was already initialized, which is excepted for daily backups")
+			myLog.Debug("The borg repo was already initialized, which is excepted for daily backups")
 		}
 	}
 
@@ -138,28 +118,29 @@ func backupServer(backupConfig config.BorgConfig, server config.Server, finished
 		cmd = cmd + " '" + p + "'"
 	}
 
+	myLog.Info("Creating new borg archive")
 	err = borg.ExecRemote(cmd)
-
 	if err != nil {
-		result.Err = fmt.Errorf("creating borg archive failed: %w", err)
-		finished <- result
-		return
+		return fmt.Errorf("creating borg archive failed: %w", err)
 	}
 
-	err = borg.ExecLocal("borg check --verbose")
-
+	myLog.Info("Pruning old backups")
+	err = borg.ExecRemote(fmt.Sprintf("borg prune --lock-wait 600 --stats %s", backupConfig.PruneSetting))
 	if err != nil {
-		result.Err = fmt.Errorf("checking borg archive failed: %w", err)
-		finished <- result
-		return
+		return fmt.Errorf("pruning borg archive failed: %w", err)
 	}
 
-	err = borg.ExecLocal(fmt.Sprintf("borg prune --lock-wait 600 --stats %s", backupConfig.PruneSetting))
-
+	myLog.Info("Checking if client was maybe messing things up for us")
+	err = borg.ExecLocal("borg check")
 	if err != nil {
-		result.Err = fmt.Errorf("pruning borg archive failed: %w", err)
-		finished <- result
-		return
+		myLog.WithError(err).Fatal("*** Borg check failed, this tends to indicate someone is messing with the data ***")
+		return fmt.Errorf("borg check failed, data corruption? : %w", err)
 	}
-	finished <- result
+
+	myLog.Info("Applying deletes if the checks were successful")
+	err = borg.ExecLocal("borg compact")
+	if err != nil {
+		return fmt.Errorf("borg compact failed, data corruption? : %w", err)
+	}
+	return nil
 }
