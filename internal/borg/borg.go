@@ -86,7 +86,7 @@ func (b Borg) proxySocketToBorgServer(sock net.Listener, appendOnly bool) {
 	} else {
 		appendAllowed = ""
 	}
-	serveCmd := fmt.Sprintf("borg serve %s --restrict-to-path %s/%s", appendAllowed, b.rootCfg.RootDir, b.cfg.BorgTarget.SubDir)
+	serveCmd := fmt.Sprintf("borg serve %s --restrict-to-repository %s/%s", appendAllowed, b.rootCfg.RootDir, b.cfg.BorgTarget.SubDir)
 	if err := b.backup.ExecuteSingleCommand(serveCmd, c, c, b.output, map[string]string{}); err != nil {
 		log.WithError(err).Error("borg serve failed")
 		return
