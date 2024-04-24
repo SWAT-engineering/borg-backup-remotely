@@ -2,47 +2,18 @@ package ssh
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"strings"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
 
 	"github.com/swat-engineering/borg-backup-remotely/internal/config"
-	"github.com/swat-engineering/borg-backup-remotely/internal/streams"
 )
 
-func NewSession(client *ssh.Client, output io.Writer) (*ssh.Session, error) {
-	session, err := client.NewSession()
-	if err != nil {
-		return nil, fmt.Errorf("opening ssh session:  %w", err)
-	}
-	log.WithField("session", session).Info("Opened session")
-
-	modes := ssh.TerminalModes{
-		ssh.ECHO:          0,
-		ssh.TTY_OP_ISPEED: 14400,
-		ssh.TTY_OP_OSPEED: 14400,
-	}
-
-	if err := session.RequestPty("xterm", 40, 80, modes); err != nil {
-		defer session.Close()
-		return nil, fmt.Errorf("requesting pty: %w", err)
-	}
-
-	if err := PipeStreams(session, output); err != nil {
-		defer session.Close()
-		return nil, err
-	}
-
-	return session, nil
-
-}
-
-func ParseSshKey(privateKey string) ssh.Signer {
+func parseSshKey(privateKey string) ssh.Signer {
 	key, err := ssh.ParsePrivateKey([]byte(privateKey))
 	if err != nil {
 		log.WithError(err).Fatal("parsing key failed")
@@ -50,15 +21,7 @@ func ParseSshKey(privateKey string) ssh.Signer {
 	return key
 }
 
-func ParseSshRawKey(privateKey string) *interface{} {
-	key, err := ssh.ParseRawPrivateKey([]byte(privateKey))
-	if err != nil {
-		log.WithError(err).Fatal("loading private key")
-	}
-	return &key
-}
-
-func CreateKnownHostFile(hosts ...string) (tempKnownHostFile string, err error) {
+func createKnownHostFile(hosts ...string) (tempKnownHostFile string, err error) {
 	knownHostTemp, err := os.CreateTemp("", "ssh-known-*")
 	if err != nil {
 		return "/dev/null", fmt.Errorf("opening SSH key: %w", err)
@@ -72,7 +35,7 @@ func CreateKnownHostFile(hosts ...string) (tempKnownHostFile string, err error) 
 }
 
 func createKnownHostChecker(hosts ...string) (ssh.HostKeyCallback, error) {
-	tempFile, err := CreateKnownHostFile(hosts...)
+	tempFile, err := createKnownHostFile(hosts...)
 	if err != nil {
 		return nil, err
 	}
@@ -81,7 +44,7 @@ func createKnownHostChecker(hosts ...string) (ssh.HostKeyCallback, error) {
 	return knownhosts.New(tempFile)
 }
 
-func DialSsh(con config.Connection) (*ssh.Client, *ssh.Client, error) {
+func dialSsh(con config.Connection) (*ssh.Client, *ssh.Client, error) {
 	khCallback, err := createKnownHostChecker(con.KnownHost, con.ProxyJumpKnownHost)
 	if err != nil {
 		return nil, nil, fmt.Errorf("constructing knownhost validator: %w", err)
@@ -90,7 +53,7 @@ func DialSsh(con config.Connection) (*ssh.Client, *ssh.Client, error) {
 	config := &ssh.ClientConfig{
 		User: con.Username,
 		Auth: []ssh.AuthMethod{
-			ssh.PublicKeys(ParseSshKey(con.PrivateKey)),
+			ssh.PublicKeys(parseSshKey(con.PrivateKey)),
 		},
 		HostKeyCallback: khCallback,
 	}
@@ -100,10 +63,14 @@ func DialSsh(con config.Connection) (*ssh.Client, *ssh.Client, error) {
 	var proxyJumpClient *ssh.Client
 	targetAddr := con.Host
 	if !strings.Contains(targetAddr, ":") {
-		targetAddr = targetAddr + ":22"
+		targetAddr += ":22"
 	}
 	if con.ProxyJumpHost != "" {
-		proxyJumpClient, err = ssh.Dial("tcp", con.ProxyJumpHost+":22", config)
+		targetJumpAddr := con.ProxyJumpHost
+		if !strings.Contains(targetJumpAddr, ":") {
+			targetJumpAddr += ":22"
+		}
+		proxyJumpClient, err = ssh.Dial("tcp", targetJumpAddr, config)
 		if err != nil {
 			return nil, nil, fmt.Errorf("connecting to proxyJumpHost: %w", err)
 		}
@@ -112,6 +79,7 @@ func DialSsh(con config.Connection) (*ssh.Client, *ssh.Client, error) {
 			defer proxyJumpClient.Close()
 			return nil, nil, fmt.Errorf("connecting to host via proxy: %w", err)
 		}
+		// now we use this tcp socket to create an ssh connection
 		c, chans, regs, err := ssh.NewClientConn(jumpedDial, targetAddr, config)
 		if err != nil {
 			defer proxyJumpClient.Close()
@@ -129,73 +97,32 @@ func DialSsh(con config.Connection) (*ssh.Client, *ssh.Client, error) {
 	return client, proxyJumpClient, nil
 }
 
-func ConfigureAgentForwarding(client *ssh.Client, sshAgent agent.Agent) error {
-	if err := agent.ForwardToAgent(client, sshAgent); err != nil {
-		return fmt.Errorf("setting up agent: %w", err)
-	}
-	// we open up an initial session, just to configure the agent forwarding
-	ses, err := client.NewSession()
-	if err != nil {
-		return fmt.Errorf("opening session: %w", err)
-	}
-	defer ses.Close()
-	if err := agent.RequestAgentForwarding(ses); err != nil {
-		return fmt.Errorf("setting up agent forwarding failed: %w", err)
-	}
-	return nil
-}
+func sendKeepAlive(client *ssh.Client, every time.Duration, maxErrors int) chan<- bool {
+	done := make(chan bool, 1)
+	go func() {
+		t := time.NewTicker(every)
+		defer t.Stop()
 
-func OpenSSHConnection(con config.Connection, sshAgent agent.Agent) (*ssh.Client, *ssh.Client, error) {
-	// first we connect to the ssh server
-	client, proxyJumpClient, err := DialSsh(con)
-	if err != nil {
-		return nil, nil, err
-	}
-	log.WithField("client", client).Info("Connected to server")
-
-	// before we do anything, we have to initiate the agent forwarding
-	if err = ConfigureAgentForwarding(client, sshAgent); err != nil {
-		defer client.Close()
-		if proxyJumpClient != nil {
-			defer proxyJumpClient.Close()
+		fails := 0
+		for {
+			select {
+			case <-t.C:
+				if _, _, err := client.SendRequest("keepalive@openssh.com", true, nil); err != nil {
+					fails++
+					if fails >= maxErrors {
+						log.WithError(err).Debug("Stopping ssh client due to keepalive misses")
+						if err := client.Close(); err != nil {
+							log.WithError(err).Error("Could not close ssh session")
+						}
+						return
+					}
+				} else {
+					fails = 0
+				}
+			case <-done:
+				return
+			}
 		}
-		return nil, nil, err
-	}
-	log.WithField("client", client).Info("Agent forwarding setup")
-
-	return client, proxyJumpClient, nil
-}
-
-type PipeAbleStreams interface {
-	StdoutPipe() (io.Reader, error)
-	StderrPipe() (io.Reader, error)
-}
-
-type PipeAbleCloseStreams interface {
-	StdoutPipe() (io.ReadCloser, error)
-	StderrPipe() (io.ReadCloser, error)
-}
-
-func PipeStreams(source PipeAbleStreams, target io.Writer) error {
-	outPipe, err1 := source.StdoutPipe()
-	errPipe, err2 := source.StderrPipe()
-	return pipeStreamsActual(outPipe, errPipe, err1, err2, target)
-}
-
-func PipeClosableStreams(source PipeAbleCloseStreams, target io.Writer) error {
-	outPipe, err1 := source.StdoutPipe()
-	errPipe, err2 := source.StderrPipe()
-	return pipeStreamsActual(outPipe, errPipe, err1, err2, target)
-}
-func pipeStreamsActual(outPipe io.Reader, errPipe io.Reader, outError error, errError error, target io.Writer) error {
-	if outError != nil {
-		return fmt.Errorf("opening out pipe: %w", outError)
-	}
-	if errError != nil {
-		return fmt.Errorf("opening err pipe: %w", errError)
-	}
-
-	go streams.CopyIgnoreError(target, outPipe)
-	go streams.CopyIgnoreError(target, errPipe)
-	return nil
+	}()
+	return done
 }

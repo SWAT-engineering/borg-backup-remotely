@@ -1,24 +1,32 @@
 # Borg Backup Remotely
 
-A tool to trigger multiple remote borg backups, being careful about who has access to which ssh key and other secrets. 
+A tool to trigger multiple remote [borg backups](https://www.borgbackup.org/), being careful about who has access to which ssh key and other secrets.
 
-Before you ask, is it overkill? Maybe, but this is as close to zero secret as I could get it.
+Before you ask, is it overkill? Maybe, but this is as close to zero trust as I could get it. It's an improvement of [borg-backups pull documentation](https://borgbackup.readthedocs.io/en/stable/deployment/pull-backup.html).
 
-The process work as follows, given a borg backup server B, and a machine where this program is running C, and a server to be backed-up T.
+In short summary:
 
-- C setups ssh connection to T with and SSH agent forwarded
-- C loads append-only backup SSH key in SSH agent with a timeout of 3 seconds
-- C sends borg create (and forwards a single connection to B ) to T and sends the backup passphrase to the stdin
-- T uses SSH agent to create SSH connection, and then starts backup process
-- C creates a local SSH agent with the prune key loaded, but only allows for a single connection to the agent
-- C now runs the borg prune command locally against B
+- minimal trust in the servers you want to backup
+- minimal trust in the server where the backup is stored (this is [the basic security model of borg backup](https://borgbackup.readthedocs.io/en/stable/internals/security.html))
+- trust the server that initiates the backups, it has all the keys, and orchestrates the backup. Ideally it's a on-demand constructed vm/container
+
+How? Well, given a borg backup server B, and a machine where this program is running C, and a server to be backed-up T:
+
+- C sets up an single ssh connection to B
+- C sets up an single ssh connection to T
+- C creates a single-use unix socket at T and forwards it to a `--append-only` & location constrained `borg serve` session on B
+- C invokes `borg` commands on T that use the unix socket for the connection to B
+- C sends the passphrase to T over stdin pipe instead of environment flags
+- C invokes `borg compact` locally (against a local unix socket that connects to a `borg serve` session on B)
+
+In essence, we use multiple SSH sessions in a single SSH connection and forward everything connections over unix-sockets instead of un-regulated local TCP ports that any process can connect to. C never forwards keys/agents to B or T.
 
 This way:
 
-- T does not need to have network access to B
-- T never has any ssh-key local that can connect to the B server
+- T does not need to have network access to B (and vice versa)
+- T never has any ssh-key local that can connect to the B server (and vice versa)
 - T never has the passphrase of the borg backup repo in the environment or a local file
-- If someone were to take over T and watch the connections coming in, they could only get hold of the backup ssh-key, which only allows appends to the backup
+- If someone were to take over T steal the unix socket, they would only be do `append-only` operations
 - You have to make sure C is secure, as it knows all the private keys and can connect to B
 
 ## Setup
@@ -44,17 +52,7 @@ Here is an example toml file:
 ```toml
 ## First we setup the borg connection info
 [Borg]
-RootDir="~/backups" # this is the main folder on your backup server where everything gets rooted under
-BackupSshKey = """
------BEGIN OPENSSH PRIVATE KEY-----
-.....
------END OPENSSH PRIVATE KEY-----
-""" # the ssh key that is constrained to only append-mode, this is used by all the servers to send their backups
-PruneSshKey = """
------BEGIN OPENSSH PRIVATE KEY-----
-.....
------END OPENSSH PRIVATE KEY-----
-""" # the ssh key that is not constrained to append-only mode
+RootDir="/home/backups" # this is the main folder on your backup server where everything gets rooted under, has to be absolute
 PruneSetting="--keep-daily 7 --keep-weekly 20 --keep-monthly 12 --keep-yearly 15"
 
 [Borg.Server]
@@ -63,6 +61,11 @@ UserName= "borg-user-name-for-backups"
 KnownHost = """
 ...
 """ # result of `ssh-keyscan <target-borg-host>`
+PrivateKey = """
+-----BEGIN OPENSSH PRIVATE KEY-----
+...
+-----END OPENSSH PRIVATE KEY-----
+""" # key of the "borg-user-name-for-backups", no `command` specification in the authorized_keys
 
 
 # Then we setup the servers we want to backup
@@ -98,20 +101,19 @@ Note that the ssh-keys for prune & backup should be different. The key for the u
 
 ### setup on server with the borg archive
 
-- borg SSH key constrained to a dir in append only mode. note that we'll create a borg backup repo per server as a subdir inside of this dir
-- separate borg prune ssh key that is allowed to manipulate borg repos (prune them)
+- ssh key that allows us to run borg
 - make sure is reachable by the server that coordinates the backups
 
 
 ### per server to backup
 
-- make sure borg backup & socat & openssh are installed
+- make sure borg backup & socat are installed
 - ssh key of the user that has read rights of the directories you want to backup.
 - set `StreamLocalBindUnlink yes` in `sshd_config`
 
 
 ## server that runs this command
 
-- install borg and openssh
+- install borg and socat
 - make sure servers to backup are reachable
 - make sure backup server is reachable
