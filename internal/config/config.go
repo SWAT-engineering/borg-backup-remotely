@@ -8,8 +8,6 @@ type BorgBackups struct {
 type BorgConfig struct {
 	Server       Connection
 	RootDir      string
-	PruneSshKey  string
-	BackupSshKey string
 	PruneSetting string
 }
 
@@ -33,5 +31,5 @@ type Server struct {
 	Excludes    []string
 
 	Connection Connection
-	BorgTarget     BorgRepo
+	BorgTarget BorgRepo
 }
