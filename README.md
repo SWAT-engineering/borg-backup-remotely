@@ -110,6 +110,7 @@ Note that the ssh-keys for prune & backup should be different. The key for the u
 - make sure borg backup & socat are installed
 - ssh key of the user that has read rights of the directories you want to backup.
 - set `StreamLocalBindUnlink yes` in `sshd_config`
+- set `AcceptEnv BORG_*` in `sshd_config`
 
 
 ## server that runs this command

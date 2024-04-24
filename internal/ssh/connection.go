@@ -50,7 +50,7 @@ func (c SshConnection) ExecuteSingleCommand(cmd string, stdIn io.Reader, stdOut 
 
 	for k, v := range env {
 		if err := session.Setenv(k, v); err != nil {
-			return fmt.Errorf("could not set %s in session: %w", k, err)
+			return fmt.Errorf("could not set %s in session (please setup AcceptEnv BORG_* in sshd_config): %w", k, err)
 		}
 	}
 
